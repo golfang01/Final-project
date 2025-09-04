@@ -5,193 +5,286 @@
   import autoTable from 'jspdf-autotable';
 
   const API_URL = 'https://demoapi-production-9077.up.railway.app';
+  const token = () => localStorage.getItem('token') ?? '';
 
-  type BookingStatus = 'PENDING' | 'APPROVE' | 'REJECTED';
-  interface Booking {
-    id: number;
-    date: string;          // ISO e.g. 2025-08-31
-    startTime: string;     // ISO datetime
-    endTime: string;       // ISO datetime
-    status: BookingStatus;
-    amount?: number | null;
+  // ฟอนต์ไทย
+  // @ts-ignore
+  import sarabunRegularUrl from '$lib/fonts/Sarabun-Regular.ttf?url';
+  // @ts-ignore
+  import sarabunBoldUrl from '$lib/fonts/Sarabun-Bold.ttf?url';
+
+  type PeriodType = 'monthly' | 'daily';
+
+  // โครงสร้างตาม 6.1
+  interface SummaryRes {
+    period?: { type?: PeriodType; date?: string|null; month?: string|null };
+    summary?: {
+      totalBookings?: number;
+      totalWalkIns?: number;
+      totalAll?: number;
+      revenue?: { bookings?: number; walkIns?: number; total?: number };
+      // กันเหนียวชื่ออื่น ๆ ที่เคยเจอ
+      totalAmountAll?: number; amountAll?: number; revenueAll?: number;
+      totalAmountBookings?: number; totalAmountWalkIns?: number;
+    };
+    details?: Array<{
+      courtId?: number;
+      courtName?: string;
+      bookings?: number;
+      walkIns?: number;
+      total?: number;
+      revenue?: { bookings?: number; walkIns?: number; total?: number };
+    }>;
   }
 
-  let bookings: Booking[] = [];
-  let loading = true;
+  const pad2 = (n:number)=> String(n).padStart(2,'0');
+  const baht = (n:number)=> `${(n||0).toLocaleString('th-TH')} ฿`;
+  const now = new Date();
+  let monthYM = `${now.getFullYear()}-${pad2(now.getMonth()+1)}`; // YYYY-MM
+
+  let loading = false;
   let err = '';
 
-  // ช่วงวันที่เริ่มต้นเป็นเดือนนี้
-  const today = new Date();
-  const y = today.getFullYear();
-  const m = today.getMonth();
-  const pad2 = (n:number)=> String(n).padStart(2,'0');
+  // state สรุปรายเดือน
+  let monthCount = 0;
+  let monthAmount = 0;
 
-  let startDate = `${y}-${pad2(m+1)}-01`;
-  let endDate   = `${y}-${pad2(m+1)}-${pad2(new Date(y, m+1, 0).getDate())}`;
+  type Row = { courtName: string; bookings: number; walkIns: number; total: number; amount: number };
+  let rows: Row[] = [];
 
-  const toYMD = (d: Date) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
-  const fmtBaht = (n:number)=> `${n.toLocaleString('th-TH')} ฿`;
-  const inRange = (ymd: string) => ymd >= startDate && ymd <= endDate;
+  function pickAmount(s: SummaryRes['summary']): number {
+    if (!s) return 0;
+    const fromRevenue = Number(s.revenue?.total);
+    if (Number.isFinite(fromRevenue)) return fromRevenue;
+    const direct = Number(s.totalAmountAll ?? s.amountAll ?? s.revenueAll);
+    if (Number.isFinite(direct)) return direct;
+    const sumBoth = Number(s.totalAmountBookings ?? 0) + Number(s.totalAmountWalkIns ?? 0);
+    return sumBoth || 0;
+  }
 
-  async function fetchBookings() {
+  function pickCount(s: SummaryRes['summary']): number {
+    if (!s) return 0;
+    const all = Number(s.totalAll);
+    if (Number.isFinite(all)) return all;
+    return Number(s.totalBookings ?? 0) + Number(s.totalWalkIns ?? 0);
+  }
+
+  async function fetchMonthly() {
     loading = true; err = '';
     try {
-      const token = localStorage.getItem('token');
-      if (!token) throw new Error('no token');
-      const res = await fetch(`${API_URL}/api/bookings`, {
-        headers: { Authorization: `Bearer ${token}` }
+      const qs = new URLSearchParams({ month: monthYM });
+      const res = await fetch(`${API_URL}/api/bookings/summary?${qs}`, {
+        headers: { Authorization: `Bearer ${token()}` },
+        cache: 'no-store'
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      bookings = await res.json();
-    } catch(e:any) {
-      err = e?.message ?? 'โหลดข้อมูลล้มเหลว';
-      bookings = [];
+
+      const data: SummaryRes = await res.json().then(d => Array.isArray(d) ? d[0] : d);
+
+      monthCount  = pickCount(data.summary);
+      monthAmount = pickAmount(data.summary);
+
+      rows = (data.details ?? []).map(d => ({
+        courtName: d.courtName ?? '-',
+        bookings: Number(d.bookings ?? 0),
+        walkIns : Number(d.walkIns  ?? 0),
+        total   : Number(d.total    ?? 0),
+        amount  : Number(d.revenue?.total ?? 0)
+      })).sort((a,b)=> b.amount - a.amount);
+    } catch (e:any) {
+      err = e?.message ?? 'โหลดข้อมูลรายเดือนไม่สำเร็จ';
+      monthCount = monthAmount = 0; rows = [];
     } finally {
       loading = false;
     }
   }
 
-  // group รายวันเฉพาะในช่วง และนับเฉพาะที่อนุมัติแล้วสำหรับยอดเงิน
-  $: grouped = (() => {
-    const map = new Map<string, {total:number, count:number}>();
-    for (const b of bookings) {
-      const ymd = (b.date?.slice(0,10)) || '';
-      if (!ymd || !inRange(ymd)) continue;
+ // ---------- สรุปยอดเงินตามสนาม (คำนวณจาก rows) ----------
+type MoneyByCourt = { courtName: string; amount: number; percent: number };
 
-      const rec = map.get(ymd) ?? { total:0, count:0 };
-      // จำนวนนับทุกสถานะ (ให้เห็นจำนวน booking ทั้งหมด)
-      rec.count += 1;
-      // ยอดเงินนับเฉพาะ APPROVE
-      if (b.status === 'APPROVE') rec.total += Number(b.amount ?? 0) || 0;
-      map.set(ymd, rec);
-    }
-    // แปลงเป็น array เรียงตามวันที่
-    return Array.from(map.entries())
-      .sort((a,b)=> a[0].localeCompare(b[0]))
-      .map(([date, v]) => ({ date, total: v.total, count: v.count }));
-  })();
+// ประกาศตัวแปรก่อน (ป้องกัน error)
+let moneyByCourt: MoneyByCourt[] = [];
+let totalAmount = 0;
 
-  $: grandTotal = grouped.reduce((s, r)=> s + r.total, 0);
-  $: grandCount = grouped.reduce((s, r)=> s + r.count, 0);
+// คำนวณใหม่ทุกครั้งที่ rows เปลี่ยน
+$: totalAmount = rows.reduce((s, r) => s + (r.amount || 0), 0);
 
-  // ---- PDF helpers ----
+$: moneyByCourt = rows.map((r) => ({
+  courtName: r.courtName,
+  amount: r.amount || 0,
+  percent: totalAmount > 0 ? ((r.amount || 0) / totalAmount) * 100 : 0
+}));
 
-  async function fetchAsBase64(url: string) {
+
+  // ---------- PDF helpers ----------
+  async function fetchAsBase64(url: string): Promise<string> {
     const res = await fetch(url);
+    if (!res.ok) throw new Error(`font HTTP ${res.status}`);
     const buf = await res.arrayBuffer();
-    // @ts-ignore
-    const bytes = new Uint8Array(buf);
     let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
     return btoa(binary);
   }
 
-  // ฝังฟอนต์ไทยเข้า jsPDF runtime
   async function ensureThaiFont(doc: jsPDF) {
-    // โหลดครั้งเดียวพอ
-    if ((doc as any).__thaiLoaded) return;
-
-    const regularB64 = await fetchAsBase64('/fonts/Sarabun-Regular.ttf');
-    const boldB64    = await fetchAsBase64('/fonts/Sarabun-Bold.ttf');
-
-    doc.addFileToVFS('Sarabun-Regular.ttf', regularB64);
-    doc.addFileToVFS('Sarabun-Bold.ttf', boldB64);
-    doc.addFont('Sarabun-Regular.ttf', 'Sarabun', 'normal');
-    doc.addFont('Sarabun-Bold.ttf', 'Sarabun', 'bold');
-    (doc as any).__thaiLoaded = true;
+    try {
+      const reg = await fetchAsBase64(sarabunRegularUrl);
+      doc.addFileToVFS('Sarabun-Regular.ttf', reg);
+      doc.addFont('Sarabun-Regular.ttf', 'Sarabun', 'normal');
+      try {
+        const bold = await fetchAsBase64(sarabunBoldUrl);
+        doc.addFileToVFS('Sarabun-Bold.ttf', bold);
+        doc.addFont('Sarabun-Bold.ttf', 'Sarabun', 'bold');
+      } catch {
+        doc.addFont('Sarabun-Regular.ttf', 'Sarabun', 'bold');
+      }
+      doc.setFont('Sarabun', 'normal');
+    } catch {
+      doc.setFont('helvetica', 'normal');
+    }
   }
 
   async function exportPDF() {
-    const doc = new jsPDF({ unit: 'pt', format: 'a4' });
-    await ensureThaiFont(doc);
-    doc.setFont('Sarabun', 'bold');
-    doc.setFontSize(14);
+    try {
+      const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+      await ensureThaiFont(doc);
 
-    const title = 'รายงานการจอง (สรุปรายวัน)';
-    doc.text(title, 40, 40);
-    doc.setFont('Sarabun', 'normal');
-    doc.setFontSize(11);
-    doc.text(`ช่วงวันที่: ${startDate} ถึง ${endDate}`, 40, 60);
+      const marginX = 48;
+      let y = 56;
 
-    // ตาราง
-    const head = [['วันที่', 'ยอดเงิน (฿)', 'จำนวนการจอง']];
-    const body = grouped.map(r => [r.date, r.total.toLocaleString('th-TH'), r.count.toString()]);
-    // @ts-ignore
-    autoTable(doc, {
-      head, body,
-      startY: 80,
-      styles: { font: 'Sarabun', fontSize: 11 },
-      headStyles: { fillColor: [21, 101, 192], textColor: 255 },
-      columnStyles: { 1: { halign: 'right' }, 2: { halign: 'right' } },
-      theme: 'striped'
-    });
+      doc.setFontSize(16);
+      doc.setFont('Sarabun','bold');
+      doc.text('รายงานการจอง (สรุปรายเดือน)', marginX, y);
 
-    // สรุปท้าย
-    let y = (doc as any).lastAutoTable?.finalY ?? 100;
-    y += 20;
-    doc.setFont('Sarabun','bold');
-    doc.text(`รวมทั้งสิ้น: ${grandTotal.toLocaleString('th-TH')} ฿   |   จำนวนการจอง: ${grandCount.toLocaleString('th-TH')}`, 40, y);
+      doc.setFont('Sarabun','normal');
+      doc.setFontSize(11);
+      y += 20;
+      doc.text(`ช่วงเดือน: ${monthYM}`, marginX, y);
+      y += 18;
+      doc.text(`จำนวนทั้งหมด: ${monthCount.toLocaleString('th-TH')}  |  ยอดเงิน: ${baht(monthAmount)}`, marginX, y);
+      y += 14;
 
-    doc.save('report.pdf');
+      const head = [['สนาม', 'จอง', 'Walk-in', 'รวมครั้ง', 'ยอดเงิน']];
+      const body = rows.map(r => [
+        r.courtName,
+        r.bookings.toLocaleString('th-TH'),
+        r.walkIns.toLocaleString('th-TH'),
+        r.total.toLocaleString('th-TH'),
+        baht(r.amount)
+      ]);
+
+      autoTable(doc, {
+        startY: y + 10,
+        head,
+        body,
+        styles: { font: 'Sarabun', fontSize: 11 },
+        headStyles: { fillColor: [22, 101, 216] },
+        margin: { left: marginX, right: marginX },
+        columnStyles: { 1:{halign:'right'}, 2:{halign:'right'}, 3:{halign:'right'}, 4:{halign:'right'} }
+      });
+
+      doc.save(`report-${monthYM}.pdf`);
+    } catch (e:any) {
+      alert(`ส่งออก PDF ไม่สำเร็จ: ${e?.message ?? 'unknown error'}`);
+    }
   }
 
-  onMount(fetchBookings);
+  onMount(fetchMonthly);
 </script>
 
 <style>
-  .card { background:#fff; border:1px solid #eee; border-radius:10px; padding:1rem; }
-  table { width:100%; border-collapse:collapse; margin-top:.5rem }
-  th, td { border-top:1px solid #eee; padding:.5rem .6rem; text-align:left }
-  th { background:#fafafa }
+  .card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:12px 14px; margin-bottom:12px; }
+  .toolbar { display:flex; gap:.5rem; align-items:center; flex-wrap:wrap }
+  .btn { padding:.45rem .7rem; border:1px solid #d1d5db; border-radius:8px; background:#fff; cursor:pointer }
+  .btn.primary { background:#2563eb; color:#fff; border-color:#2563eb }
+  .muted { color:#6b7280 }
+  table { width:100%; border-collapse:collapse }
+  th,td { padding:8px; border-top:1px solid #eee; text-align:right }
+  th:first-child, td:first-child { text-align:left }
+  th { background:#f8fafc }
+  tfoot td { background:#f3f4f6; font-weight:700 }
+  h3 { margin:0 0 .5rem 0 }
   .right { text-align:right }
-  .grid { display:grid; gap:1rem; grid-template-columns: 1fr 1fr; }
 </style>
 
-<h2>📄 Reports</h2>
+<h2>Reports</h2>
 
-<div class="card" style="display:flex; gap:.5rem; align-items:center; flex-wrap:wrap">
+<div class="card toolbar">
   <div>
-    <label>วันที่เริ่ม: </label>
-    <input type="date" bind:value={startDate} />
+    <label>เลือกเดือน: </label>
+    <input type="month" bind:value={monthYM} />
   </div>
-  <div>
-    <label>ถึง: </label>
-    <input type="date" bind:value={endDate} />
-  </div>
-  <button on:click={exportPDF}>ส่งออก PDF</button>
+  <button class="btn" on:click={fetchMonthly} disabled={loading}>
+    {loading ? 'กำลังดึง…' : 'ดึงเฉพาะเดือนนี้'}
+  </button>
+  <button class="btn primary" on:click={exportPDF} disabled={loading || rows.length===0}>
+    ส่งออก PDF
+  </button>
 </div>
 
-{#if loading}
-  <div class="card">กำลังโหลดข้อมูล…</div>
-{:else if err}
+{#if err}
   <div class="card" style="color:#b91c1c;background:#fff6f6;border-color:#ffdcdc">❌ {err}</div>
 {:else}
   <div class="card">
-    <strong>สรุปรายวัน</strong>
-    <table>
-      <thead>
-        <tr>
-          <th>วันที่</th>
-          <th class="right">ยอดเงิน (฿)</th>
-          <th class="right">จำนวนการจอง</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each grouped as r}
+    <h3>สรุปรายเดือน ({monthYM})</h3>
+    <div class="muted" style="margin:.25rem 0 .75rem 0">
+      จำนวนทั้งหมด: <b>{monthCount.toLocaleString('th-TH')}</b> |
+      ยอดเงิน: <b>{(monthAmount||0).toLocaleString('th-TH')} ฿</b>
+    </div>
+
+    {#if rows.length === 0}
+      <div class="muted">— ไม่มีข้อมูล —</div>
+    {:else}
+      <!-- ตารางหลัก -->
+      <table>
+        <thead>
           <tr>
-            <td>{r.date}</td>
-            <td class="right">{r.total.toLocaleString('th-TH')}</td>
-            <td class="right">{r.count.toLocaleString('th-TH')}</td>
+            <th>สนาม</th><th>จอง</th><th>Walk-in</th><th>รวมครั้ง</th><th>ยอดเงิน</th>
           </tr>
-        {/each}
-      </tbody>
-      <tfoot>
-        <tr>
-          <th>รวม</th>
-          <th class="right">{grandTotal.toLocaleString('th-TH')}</th>
-          <th class="right">{grandCount.toLocaleString('th-TH')}</th>
-        </tr>
-      </tfoot>
-    </table>
+        </thead>
+        <tbody>
+          {#each rows as r}
+            <tr>
+              <td>{r.courtName}</td>
+              <td>{r.bookings.toLocaleString('th-TH')}</td>
+              <td>{r.walkIns.toLocaleString('th-TH')}</td>
+              <td>{r.total.toLocaleString('th-TH')}</td>
+              <td>{(r.amount||0).toLocaleString('th-TH')} ฿</td>
+            </tr>
+          {/each}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td>รวมทั้งหมด</td>
+            <td>{rows.reduce((s,r)=>s+r.bookings,0).toLocaleString('th-TH')}</td>
+            <td>{rows.reduce((s,r)=>s+r.walkIns,0).toLocaleString('th-TH')}</td>
+            <td>{rows.reduce((s,r)=>s+r.total,0).toLocaleString('th-TH')}</td>
+            <td>{rows.reduce((s,r)=>s+r.amount,0).toLocaleString('th-TH')} ฿</td>
+          </tr>
+        </tfoot>
+      </table>
+
+      <!-- ตารางสรุปยอดเงินตามสนาม -->
+      <div style="margin-top:1rem">
+        <h3>สรุปยอดเงินตามสนาม</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>สนาม</th><th>ยอดเงิน</th><th>สัดส่วน</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each moneyByCourt as m}
+              <tr>
+                <td>{m.courtName}</td>
+                <td class="right">{m.amount.toLocaleString('th-TH')} ฿</td>
+                <td class="right">{m.percent.toFixed(1)}%</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
   </div>
 {/if}
